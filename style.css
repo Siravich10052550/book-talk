@@ -245,6 +245,7 @@ label { font-size: 0.85rem; color: var(--ink-soft); display: flex; align-items: 
 .badge.status-reading { background: #dcefe0; color: #2f6b3c; }
 .badge.status-finished { background: #e3ddf5; color: #4d3c8f; }
 .badge.status-want { background: #f5e6d3; color: var(--amber-dark); }
+.badge.status-paused { background: #e8e3dc; color: #7a7268; }
 
 .empty-state {
   text-align: center;

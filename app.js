@@ -948,7 +948,7 @@ function debounce(fn, wait) {
 }
 
 async function searchOpenLibrary(query) {
-  const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&fields=title,author_name,cover_i,first_publish_year&limit=12`;
+  const url = `https://openlibrary.org/search.json?q=${encodeURIComponent(query)}&fields=title,author_name,cover_i,first_publish_year,key&limit=12`;
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Search failed (${resp.status})`);
   const data = await resp.json();
@@ -957,7 +957,112 @@ async function searchOpenLibrary(query) {
     author: (doc.author_name && doc.author_name[0]) || 'Unknown author',
     year: doc.first_publish_year || null,
     coverId: doc.cover_i || null,
+    workKey: doc.key || null,
   }));
+}
+
+function extractDescriptionText(data) {
+  if (!data || !data.description) return null;
+  const text = typeof data.description === 'string' ? data.description : data.description.value;
+  return text ? text.trim() : null;
+}
+
+async function fetchWorkDescription(workKey) {
+  if (!workKey) return null;
+  const resp = await fetch(`https://openlibrary.org${workKey}.json`);
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const text = extractDescriptionText(data);
+  if (!text) return null;
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > 240 ? `${oneLine.slice(0, 240).trim()}…` : oneLine;
+}
+
+/* In-memory only (not persisted) — carries search-result data (title/author/
+   year/cover) from a search card click over to the preview page, so the
+   preview doesn't need to re-resolve the author separately. */
+const previewCache = {};
+
+/* Caches Open Library lookups for the static starter shelf, keyed by
+   title+author, so switching the tag filter doesn't re-hit the network. */
+const starterLookupCache = {};
+
+function getStarterOpenLibraryInfo(book) {
+  const key = `${book.title}|${book.author}`;
+  if (!starterLookupCache[key]) {
+    starterLookupCache[key] = searchOpenLibrary(`${book.title} ${book.author}`)
+      .then((results) => results[0] || null)
+      .catch(() => null);
+  }
+  return starterLookupCache[key];
+}
+
+async function renderPreviewPage(app, workKeyRaw) {
+  const workKey = decodeURIComponent(workKeyRaw || '');
+  const cached = previewCache[workKey] || {};
+  app.innerHTML = '';
+
+  const back = document.createElement('a');
+  back.className = 'back-link';
+  back.href = '#/discover';
+  back.textContent = '← Back';
+  app.appendChild(back);
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  const coverHtml = cached.coverId
+    ? `<img src="https://covers.openlibrary.org/b/id/${cached.coverId}-L.jpg" alt="" style="width:170px;border-radius:10px;box-shadow:var(--shadow);margin-bottom:16px;display:block;" />`
+    : '';
+  card.innerHTML = `${coverHtml}
+    <h1>${esc(cached.title || 'Book preview')}</h1>
+    <div class="book-author" style="font-size:1rem;margin-bottom:14px;">${esc(cached.author || 'Unknown author')}${cached.year ? ` · ${esc(cached.year)}` : ''}</div>
+    <div id="preview-desc" class="muted-text" style="padding:0;">Loading full description…</div>
+    <div id="preview-actions" style="margin-top:18px;"></div>`;
+  app.appendChild(card);
+
+  const descEl = card.querySelector('#preview-desc');
+  const actionsEl = card.querySelector('#preview-actions');
+
+  function renderActions() {
+    actionsEl.innerHTML = '';
+    if (!cached.title) return;
+    const d = loadData();
+    const already = bookExists(d, cached.title, cached.author || '');
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-small ' + (already ? 'btn-ghost' : 'btn-primary');
+    btn.textContent = already ? 'In your library' : 'Add to want-to-read';
+    btn.disabled = already;
+    btn.addEventListener('click', () => {
+      const dd = loadData();
+      addBookToLibrary(dd, { title: cached.title, author: cached.author || '', genre: '' });
+      saveData(dd);
+      renderActions();
+    });
+    actionsEl.appendChild(btn);
+  }
+  renderActions();
+
+  if (!workKey) {
+    descEl.textContent = 'No further details available for this result.';
+    return;
+  }
+
+  try {
+    const resp = await fetch(`https://openlibrary.org${workKey}.json`);
+    if (!resp.ok) throw new Error(`Failed (${resp.status})`);
+    const data = await resp.json();
+    const desc = extractDescriptionText(data);
+    descEl.textContent = desc || 'No description available for this book.';
+    descEl.style.whiteSpace = 'pre-wrap';
+    descEl.style.lineHeight = '1.6';
+    if (!cached.title && data.title) {
+      card.querySelector('h1').textContent = data.title;
+      cached.title = data.title;
+      renderActions();
+    }
+  } catch (err) {
+    descEl.textContent = `Couldn't load the full description (${err.message}). Check your internet connection.`;
+  }
 }
 
 /* ---------- vocabulary lookup (free dictionary + free translation, no keys) ---------- */
@@ -1198,12 +1303,30 @@ function renderBookSearch(app, { title = 'Search for a book', onAdded } = {}) {
         const already = bookExists(d, r.title, r.author);
         const item = document.createElement('div');
         item.className = 'book-card';
-        item.style.cursor = 'default';
         const coverHtml = r.coverId
           ? `<img src="https://covers.openlibrary.org/b/id/${r.coverId}-M.jpg" alt="" style="width:100%;height:120px;object-fit:cover;border-radius:8px;margin-bottom:8px;" />`
           : '';
-        item.innerHTML = `${coverHtml}<h3>${esc(r.title)}</h3>
-          <div class="book-author">${esc(r.author)}${r.year ? ` · ${esc(r.year)}` : ''}</div>`;
+        item.innerHTML = `<div class="preview-trigger" style="cursor:pointer;">
+            ${coverHtml}<h3>${esc(r.title)}</h3>
+            <div class="book-author">${esc(r.author)}${r.year ? ` · ${esc(r.year)}` : ''}</div>
+            <div class="book-desc muted-text" style="padding:0;font-size:0.82rem;margin-top:6px;">Loading description…</div>
+          </div>`;
+        if (r.workKey) {
+          item.querySelector('.preview-trigger').addEventListener('click', () => {
+            previewCache[r.workKey] = r;
+            location.hash = `#/preview/${encodeURIComponent(r.workKey)}`;
+          });
+        }
+        const descEl = item.querySelector('.book-desc');
+        fetchWorkDescription(r.workKey)
+          .then((desc) => {
+            if (desc) {
+              descEl.textContent = desc;
+            } else {
+              descEl.remove();
+            }
+          })
+          .catch(() => descEl.remove());
         const btn = document.createElement('button');
         btn.className = 'btn btn-small ' + (already ? 'btn-ghost' : 'btn-primary');
         btn.style.marginTop = '10px';
@@ -1568,57 +1691,6 @@ function renderPickResult(slotEl, pick) {
 
 /* ---------- pages ---------- */
 
-function renderQuickRecCard(app) {
-  const card = document.createElement('div');
-  card.className = 'card';
-  card.innerHTML = '<div class="card-title">Someone just told you about a book?</div><div id="quickrec-slot"></div>';
-  app.appendChild(card);
-  const slot = card.querySelector('#quickrec-slot');
-
-  function renderForm() {
-    slot.innerHTML = `<div style="display:flex;gap:8px;flex-wrap:wrap;">
-      <input type="text" id="qr-title" placeholder="Book title" style="flex:2;min-width:160px;" />
-      <input type="text" id="qr-who" placeholder="Who recommended it? (optional)" style="flex:1;min-width:160px;" />
-      <button class="btn btn-primary" id="qr-save-btn">Save to my list</button>
-    </div>`;
-    const titleInput = slot.querySelector('#qr-title');
-    const whoInput = slot.querySelector('#qr-who');
-
-    function save() {
-      const t = titleInput.value.trim();
-      if (!t) return;
-      const who = whoInput.value.trim();
-      const d = loadData();
-      addBookToLibrary(d, { title: t, author: '', genre: '', recommendedBy: who });
-      saveData(d);
-      slot.innerHTML = '';
-      const p = document.createElement('p');
-      p.className = 'muted-text';
-      p.style.padding = '0';
-      p.textContent = `Saved "${t}"${who ? ` (thanks, ${who}!)` : ''} — you can fill in the rest later.`;
-      slot.appendChild(p);
-      const again = document.createElement('button');
-      again.className = 'btn btn-ghost btn-small';
-      again.style.marginTop = '8px';
-      again.textContent = 'Log another';
-      again.addEventListener('click', renderForm);
-      slot.appendChild(again);
-    }
-
-    slot.querySelector('#qr-save-btn').addEventListener('click', save);
-    [titleInput, whoInput].forEach((el) =>
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          save();
-        }
-      })
-    );
-  }
-
-  renderForm();
-}
-
 function renderHome(app) {
   const data = loadData();
   app.innerHTML = '';
@@ -1626,8 +1698,6 @@ function renderHome(app) {
   const title = document.createElement('h1');
   title.textContent = 'Welcome back';
   app.appendChild(title);
-
-  renderQuickRecCard(app);
 
   const currentlyReading = data.books.filter((b) => b.status === 'reading');
   const continueBook = currentlyReading.find((b) => b.id === data.lastVisitedBookId) || currentlyReading[0];
@@ -2209,10 +2279,13 @@ function renderDiscover(app) {
       const already = bookExists(d, b.title, b.author);
       const card = document.createElement('div');
       card.className = 'book-card';
-      card.style.cursor = 'default';
-      card.innerHTML = `<h3>${esc(b.title)}</h3>
-        <div class="book-author">${esc(b.author)}</div>
-        <div class="book-meta">${b.tags.map((t) => `<span class="badge">${esc(TAG_LABELS[t])}</span>`).join('')}</div>`;
+      card.innerHTML = `<div class="preview-trigger" style="cursor:pointer;">
+          <div class="starter-cover" style="width:100%;height:120px;border-radius:8px;margin-bottom:8px;background:linear-gradient(160deg, var(--amber), var(--terracotta));display:flex;align-items:center;justify-content:center;font-size:1.6rem;color:#fff8ec;">📖</div>
+          <h3>${esc(b.title)}</h3>
+          <div class="book-author">${esc(b.author)}</div>
+          <div class="book-meta">${b.tags.map((t) => `<span class="badge">${esc(TAG_LABELS[t])}</span>`).join('')}</div>
+          <div class="book-desc muted-text" style="padding:0;font-size:0.82rem;margin-top:6px;">Loading description…</div>
+        </div>`;
       const btn = document.createElement('button');
       btn.className = 'btn btn-small ' + (already ? 'btn-ghost' : 'btn-primary');
       btn.style.marginTop = '10px';
@@ -2226,6 +2299,42 @@ function renderDiscover(app) {
       });
       card.appendChild(btn);
       grid.appendChild(card);
+
+      const triggerEl = card.querySelector('.preview-trigger');
+      const coverEl = card.querySelector('.starter-cover');
+      const descEl = card.querySelector('.book-desc');
+
+      getStarterOpenLibraryInfo(b)
+        .then((info) => {
+          if (!info) {
+            descEl.textContent = 'No description available.';
+            return;
+          }
+          if (info.coverId) {
+            coverEl.outerHTML = `<img src="https://covers.openlibrary.org/b/id/${info.coverId}-M.jpg" alt="" style="width:100%;height:120px;object-fit:cover;border-radius:8px;margin-bottom:8px;" />`;
+          }
+          if (info.workKey) {
+            triggerEl.addEventListener('click', () => {
+              previewCache[info.workKey] = {
+                title: b.title,
+                author: b.author,
+                year: info.year,
+                coverId: info.coverId,
+                workKey: info.workKey,
+              };
+              location.hash = `#/preview/${encodeURIComponent(info.workKey)}`;
+            });
+            fetchWorkDescription(info.workKey)
+              .then((desc) => {
+                if (desc) descEl.textContent = desc;
+                else descEl.remove();
+              })
+              .catch(() => descEl.remove());
+          } else {
+            descEl.remove();
+          }
+        })
+        .catch(() => descEl.remove());
     });
   }
   renderStarterGrid();
@@ -2375,6 +2484,8 @@ function route() {
 
   if (hash.startsWith('#/book/')) {
     renderBookPage(app, decodeURIComponent(hash.slice('#/book/'.length)));
+  } else if (hash.startsWith('#/preview/')) {
+    renderPreviewPage(app, hash.slice('#/preview/'.length));
   } else if (hash === '#/library') {
     renderLibrary(app);
   } else if (hash === '#/discover') {
