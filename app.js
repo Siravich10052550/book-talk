@@ -461,6 +461,7 @@ function defaultData() {
     lastVisitedBookId: null,
     appliedWisdom: [], // { id, date, ts, sourceBookId, sourceBookTitle, sourceNoteId, sourceText, reaction, note }
     connections: [], // { id, ts, bookATitle, bookBTitle, prompt, note }
+    updatedAt: 0,
   };
 }
 
@@ -480,6 +481,9 @@ function normalizeBook(b) {
     notes: Array.isArray(b.notes) ? b.notes : [],
     themes: Array.isArray(b.themes) ? b.themes : [],
     vocabulary: Array.isArray(b.vocabulary) ? b.vocabulary : [],
+    recommendedBy: b.recommendedBy || '',
+    pauseReason: b.pauseReason || null,
+    pausedAt: b.pausedAt || null,
   };
 }
 
@@ -495,6 +499,7 @@ function loadData() {
       lastVisitedBookId: parsed.lastVisitedBookId || null,
       appliedWisdom: Array.isArray(parsed.appliedWisdom) ? parsed.appliedWisdom : [],
       connections: Array.isArray(parsed.connections) ? parsed.connections : [],
+      updatedAt: parsed.updatedAt || 0,
     };
   } catch (e) {
     return defaultData();
@@ -502,7 +507,111 @@ function loadData() {
 }
 
 function saveData(data) {
+  data.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  scheduleCloudPush(data);
+}
+
+/* ---------- cloud sync (Firebase) ----------
+   Links this device to others via a shared "sync code". Whoever has the
+   same code reads/writes the same Firestore document. Newest updatedAt wins. */
+
+const FIREBASE_CONFIG = {
+  apiKey: "AIzaSyAQRH7_SKS_s-Bqy2zsh0cQIrL-QP4iHpQ",
+  authDomain: "book-talk-e6fea.firebaseapp.com",
+  projectId: "book-talk-e6fea",
+  storageBucket: "book-talk-e6fea.firebasestorage.app",
+  messagingSenderId: "97088561899",
+  appId: "1:97088561899:web:43ce3c420c9fbbfcb594ae",
+};
+const SYNC_CODE_KEY = 'bookTalkSyncCode';
+
+let cloudDb = null;
+let cloudPushTimer = null;
+let applyingRemoteUpdate = false;
+
+function getSyncCode() {
+  return (localStorage.getItem(SYNC_CODE_KEY) || '').trim();
+}
+
+function setSyncCode(code) {
+  localStorage.setItem(SYNC_CODE_KEY, code.trim());
+}
+
+function updateSyncStatusUI() {
+  const el = document.getElementById('syncLink');
+  if (!el) return;
+  const code = getSyncCode();
+  el.textContent = code ? '🔗 Synced' : '🔗 Sync';
+  el.title = code ? `Linked with sync code "${code}"` : 'Not linked to another device yet';
+}
+
+function attachCloudListener(code) {
+  if (!cloudDb || !code) return;
+  const docRef = cloudDb.collection('syncData').doc(code);
+  docRef.onSnapshot(
+    (snap) => {
+      const local = loadData();
+      if (!snap.exists) {
+        docRef.set(local).catch((e) => console.error('Book Talk: initial sync push failed', e));
+        return;
+      }
+      const remote = snap.data();
+      if ((remote.updatedAt || 0) > (local.updatedAt || 0)) {
+        applyingRemoteUpdate = true;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+        applyingRemoteUpdate = false;
+        if (typeof route === 'function') route();
+      } else if ((local.updatedAt || 0) > (remote.updatedAt || 0)) {
+        docRef.set(local).catch((e) => console.error('Book Talk: sync push failed', e));
+      }
+    },
+    (e) => console.error('Book Talk: sync listener error', e)
+  );
+}
+
+function scheduleCloudPush(data) {
+  const code = getSyncCode();
+  if (!code || !cloudDb || applyingRemoteUpdate) return;
+  clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(() => {
+    cloudDb
+      .collection('syncData')
+      .doc(code)
+      .set(data)
+      .catch((e) => console.error('Book Talk: sync push failed', e));
+  }, 800);
+}
+
+function promptForSyncCode() {
+  const existing = getSyncCode();
+  const input = window.prompt(
+    existing
+      ? 'This device is linked with the sync code below. Enter the same code on your other device to link it too (or change it here to re-link this one):'
+      : 'Make up a sync code (any word or phrase) and enter the exact same one on every device you want to keep in sync:',
+    existing
+  );
+  if (input && input.trim()) {
+    setSyncCode(input);
+    updateSyncStatusUI();
+    attachCloudListener(input.trim());
+  }
+}
+
+function initCloudSync() {
+  if (typeof firebase === 'undefined') return;
+  firebase.initializeApp(FIREBASE_CONFIG);
+  cloudDb = firebase.firestore();
+  firebase
+    .auth()
+    .signInAnonymously()
+    .catch((e) => console.error('Book Talk: sync sign-in failed', e));
+  firebase.auth().onAuthStateChanged((user) => {
+    if (!user) return;
+    const code = getSyncCode();
+    if (code) attachCloudListener(code);
+  });
+  updateSyncStatusUI();
 }
 
 /* ---------- small utilities ---------- */
@@ -518,14 +627,31 @@ function esc(str) {
 }
 
 function statusLabel(status) {
-  return { want: 'Want to read', reading: 'Reading', finished: 'Finished' }[status] || status;
+  return { want: 'Want to read', reading: 'Reading', paused: 'Paused', finished: 'Finished' }[status] || status;
 }
 
 function countStatuses(books) {
   return books.reduce((acc, b) => {
     acc[b.status] = (acc[b.status] || 0) + 1;
     return acc;
-  }, { want: 0, reading: 0, finished: 0 });
+  }, { want: 0, reading: 0, paused: 0, finished: 0 });
+}
+
+const PAUSE_REASONS = [
+  { key: 'lost-interest', label: 'Lost interest' },
+  { key: 'wrong-mood', label: 'Not the right mood' },
+  { key: 'too-dense', label: 'Got too dense' },
+  { key: 'distracted', label: 'Something else pulled me away' },
+];
+
+function countByPauseReason(books) {
+  const counts = {};
+  books.forEach((b) => {
+    if (b.status === 'paused' && b.pauseReason) {
+      counts[b.pauseReason] = (counts[b.pauseReason] || 0) + 1;
+    }
+  });
+  return counts;
 }
 
 function formatDate(d) {
@@ -551,9 +677,16 @@ function findBook(data, title, author) {
   );
 }
 
-function addBookToLibrary(data, { title, author, genre }) {
+function addBookToLibrary(data, { title, author, genre, recommendedBy }) {
   if (bookExists(data, title, author)) return null;
-  const book = normalizeBook({ id: uid(), title, author, genre: genre || '', status: 'want' });
+  const book = normalizeBook({
+    id: uid(),
+    title,
+    author,
+    genre: genre || '',
+    status: 'want',
+    recommendedBy: recommendedBy || '',
+  });
   data.books.unshift(book);
   return book;
 }
@@ -1297,20 +1430,6 @@ function renderConnectionCard(app) {
   showButton();
 }
 
-function renderBadgesSummary(app, data) {
-  const badges = computeBadges(data);
-  const unlocked = badges.filter((b) => b.unlocked);
-  if (!unlocked.length) return;
-  const card = document.createElement('div');
-  card.className = 'card';
-  card.innerHTML = `<div class="card-title">Your badges</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;">
-      ${unlocked.map((b) => `<span class="badge">${b.emoji} ${esc(b.label)}</span>`).join('')}
-    </div>
-    <a href="#/progress" style="font-size:0.8rem;display:inline-block;margin-top:10px;">See all badges →</a>`;
-  app.appendChild(card);
-}
-
 function renderBadgeShelf(app, data) {
   const badges = computeBadges(data);
   const card = document.createElement('div');
@@ -1449,6 +1568,57 @@ function renderPickResult(slotEl, pick) {
 
 /* ---------- pages ---------- */
 
+function renderQuickRecCard(app) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = '<div class="card-title">Someone just told you about a book?</div><div id="quickrec-slot"></div>';
+  app.appendChild(card);
+  const slot = card.querySelector('#quickrec-slot');
+
+  function renderForm() {
+    slot.innerHTML = `<div style="display:flex;gap:8px;flex-wrap:wrap;">
+      <input type="text" id="qr-title" placeholder="Book title" style="flex:2;min-width:160px;" />
+      <input type="text" id="qr-who" placeholder="Who recommended it? (optional)" style="flex:1;min-width:160px;" />
+      <button class="btn btn-primary" id="qr-save-btn">Save to my list</button>
+    </div>`;
+    const titleInput = slot.querySelector('#qr-title');
+    const whoInput = slot.querySelector('#qr-who');
+
+    function save() {
+      const t = titleInput.value.trim();
+      if (!t) return;
+      const who = whoInput.value.trim();
+      const d = loadData();
+      addBookToLibrary(d, { title: t, author: '', genre: '', recommendedBy: who });
+      saveData(d);
+      slot.innerHTML = '';
+      const p = document.createElement('p');
+      p.className = 'muted-text';
+      p.style.padding = '0';
+      p.textContent = `Saved "${t}"${who ? ` (thanks, ${who}!)` : ''} — you can fill in the rest later.`;
+      slot.appendChild(p);
+      const again = document.createElement('button');
+      again.className = 'btn btn-ghost btn-small';
+      again.style.marginTop = '8px';
+      again.textContent = 'Log another';
+      again.addEventListener('click', renderForm);
+      slot.appendChild(again);
+    }
+
+    slot.querySelector('#qr-save-btn').addEventListener('click', save);
+    [titleInput, whoInput].forEach((el) =>
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          save();
+        }
+      })
+    );
+  }
+
+  renderForm();
+}
+
 function renderHome(app) {
   const data = loadData();
   app.innerHTML = '';
@@ -1456,6 +1626,8 @@ function renderHome(app) {
   const title = document.createElement('h1');
   title.textContent = 'Welcome back';
   app.appendChild(title);
+
+  renderQuickRecCard(app);
 
   const currentlyReading = data.books.filter((b) => b.status === 'reading');
   const continueBook = currentlyReading.find((b) => b.id === data.lastVisitedBookId) || currentlyReading[0];
@@ -1501,33 +1673,6 @@ function renderHome(app) {
   renderHeatmapInto(streakCard.querySelector('#heatmap'), data.logs);
   renderLogTodayWidget(streakCard.querySelector('#log-today-slot'));
 
-  const finishedThisYear = countFinishedThisYear(data.books);
-  const goalPct = data.goal.targetBooksPerYear
-    ? Math.min(100, Math.round((finishedThisYear / data.goal.targetBooksPerYear) * 100))
-    : 0;
-  const goalCard = document.createElement('div');
-  goalCard.className = 'card';
-  goalCard.innerHTML = `<div class="card-title">This year's goal</div>
-    <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-      <span>${finishedThisYear} of ${data.goal.targetBooksPerYear} books</span>
-      <a href="#/progress" style="font-size:0.82rem;">See progress →</a>
-    </div>
-    <div class="progress-bar-track"><div class="progress-bar-fill" style="width:${goalPct}%"></div></div>`;
-  app.appendChild(goalCard);
-
-  const pickCard = document.createElement('div');
-  pickCard.className = 'card pick-card';
-  pickCard.innerHTML = `<div class="card-title">Don't know what to read?</div>
-    <div id="pick-slot"><button class="btn btn-primary" id="pick-btn">Pick something for me</button></div>`;
-  app.appendChild(pickCard);
-  pickCard.querySelector('#pick-btn').addEventListener('click', () => {
-    const d = loadData();
-    renderPickResult(pickCard.querySelector('#pick-slot'), pickForMe(d));
-  });
-
-  renderConnectionCard(app);
-  renderBadgesSummary(app, data);
-
   const quote = QUOTES[Math.floor(Math.random() * QUOTES.length)];
   const quoteCard = document.createElement('div');
   quoteCard.className = 'card quote-card';
@@ -1546,8 +1691,9 @@ function renderLibrary(app) {
     <div class="stats-row">
       <span><b>${data.books.length}</b> total</span>
       <span><b>${counts.reading}</b> reading</span>
-      <span><b>${counts.finished}</b> finished</span>
       <span><b>${counts.want}</b> want to read</span>
+      <span><b>${counts.paused}</b> paused</span>
+      <span><b>${counts.finished}</b> finished</span>
     </div>`;
   app.appendChild(header);
 
@@ -1597,7 +1743,7 @@ function renderLibrary(app) {
     return;
   }
 
-  const statusOrder = { reading: 0, want: 1, finished: 2 };
+  const statusOrder = { reading: 0, want: 1, paused: 2, finished: 3 };
   const sortedBooks = data.books.slice().sort((a, b) => statusOrder[a.status] - statusOrder[b.status]);
 
   const grid = document.createElement('div');
@@ -1613,6 +1759,7 @@ function renderLibrary(app) {
         <span class="badge status-${book.status}">${esc(statusLabel(book.status))}</span>
         ${book.genre ? `<span class="badge">${esc(book.genre)}</span>` : ''}
       </div>
+      ${book.recommendedBy ? `<div style="font-size:0.78rem;color:var(--ink-soft);margin-top:6px;">Recommended by ${esc(book.recommendedBy)}</div>` : ''}
       ${pct !== null ? `<div class="progress-bar-track" style="margin-top:10px;"><div class="progress-bar-fill" style="width:${pct}%"></div></div>` : ''}`;
     grid.appendChild(card);
   });
@@ -1688,10 +1835,12 @@ function renderBookPage(app, bookId) {
         <select id="status-select">
           <option value="want">Want to read</option>
           <option value="reading">Reading</option>
+          <option value="paused">Paused</option>
           <option value="finished">Finished</option>
         </select>
         ${book.genre ? `<span class="badge">${esc(book.genre)}</span>` : ''}
       </div>
+      ${book.recommendedBy ? `<div style="font-size:0.85rem;color:var(--ink-soft);margin-top:6px;">Recommended by ${esc(book.recommendedBy)}</div>` : ''}
     </div>
     <button id="delete-book-btn" class="btn btn-danger btn-small">Delete</button>`;
   app.appendChild(header);
@@ -1705,10 +1854,43 @@ function renderBookPage(app, bookId) {
     const newStatus = e.target.value;
     if (newStatus === 'reading' && !b.dateStarted) b.dateStarted = new Date().toISOString();
     if (newStatus === 'finished' && !b.dateFinished) b.dateFinished = new Date().toISOString();
+    if (newStatus === 'paused') {
+      b.pausedAt = new Date().toISOString();
+      b.pauseReason = null;
+    }
     b.status = newStatus;
     saveData(d);
     renderBookPage(app, bookId);
   });
+
+  if (book.status === 'paused' && !book.pauseReason) {
+    const pauseCard = document.createElement('div');
+    pauseCard.className = 'card notice';
+    pauseCard.innerHTML = `<div style="margin-bottom:10px;">It's okay to set a book aside — no shame here. Want to note why, just for your own patterns? Totally optional.</div>
+      <div id="pause-reason-chips" style="display:flex;gap:8px;flex-wrap:wrap;"></div>`;
+    app.appendChild(pauseCard);
+    const chipsEl = pauseCard.querySelector('#pause-reason-chips');
+    PAUSE_REASONS.forEach((r) => {
+      const chip = document.createElement('button');
+      chip.className = 'chip';
+      chip.textContent = r.label;
+      chip.addEventListener('click', () => {
+        const d = loadData();
+        const b = d.books.find((x) => x.id === bookId);
+        if (!b) return;
+        b.pauseReason = r.key;
+        saveData(d);
+        renderBookPage(app, bookId);
+      });
+      chipsEl.appendChild(chip);
+    });
+    const skipBtn = document.createElement('button');
+    skipBtn.className = 'btn btn-ghost btn-small';
+    skipBtn.textContent = 'Skip';
+    skipBtn.style.marginTop = '10px';
+    skipBtn.addEventListener('click', () => pauseCard.remove());
+    pauseCard.appendChild(skipBtn);
+  }
 
   header.querySelector('#delete-book-btn').addEventListener('click', () => {
     if (!confirm(`Delete "${book.title}" and its notes? This can't be undone.`)) return;
@@ -1994,6 +2176,8 @@ function renderDiscover(app) {
     renderPickResult(pickCard.querySelector('#pick-slot'), pickForMe(d));
   });
 
+  renderConnectionCard(app);
+
   const listCard = document.createElement('div');
   listCard.className = 'card';
   listCard.innerHTML = `<div class="card-title">Starter shelf</div>
@@ -2140,6 +2324,23 @@ function renderProgress(app) {
   }
   app.appendChild(genreCard);
 
+  const pauseCounts = countByPauseReason(data.books);
+  if (Object.keys(pauseCounts).length > 0) {
+    const pauseLabel = (key) => (PAUSE_REASONS.find((r) => r.key === key) || {}).label || key;
+    const pauseCard = document.createElement('div');
+    pauseCard.className = 'card';
+    const sortedPause = Object.entries(pauseCounts).sort((a, b) => b[1] - a[1]);
+    pauseCard.innerHTML =
+      '<div class="card-title">Why books get paused for you</div>' +
+      sortedPause
+        .map(
+          ([k, c]) =>
+            `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--border);"><span>${esc(pauseLabel(k))}</span><span>${c}</span></div>`
+        )
+        .join('');
+    app.appendChild(pauseCard);
+  }
+
   const themeCounts = countByTheme(data.books);
   const themeCard = document.createElement('div');
   themeCard.className = 'card';
@@ -2187,3 +2388,13 @@ function route() {
 
 window.addEventListener('hashchange', route);
 window.addEventListener('DOMContentLoaded', route);
+window.addEventListener('DOMContentLoaded', () => {
+  const syncLink = document.getElementById('syncLink');
+  if (syncLink) {
+    syncLink.addEventListener('click', (e) => {
+      e.preventDefault();
+      promptForSyncCode();
+    });
+  }
+  initCloudSync();
+});
